@@ -46,25 +46,36 @@ class AttentionCouple:
                 "negative": ("CONDITIONING",),
                 "mode": (["Attention", "Latent"], ),
                 "isolation_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+            "optional": {
+                "shared_positive": ("CONDITIONING",),
+                "shared_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
     FUNCTION = "attention_couple"
     CATEGORY = "loaders"
 
-    def attention_couple(self, model, positive, negative, mode, isolation_factor):
+    def attention_couple(self, model, positive, negative, mode, isolation_factor, shared_positive=None, shared_weight=0.5):
         if mode == "Latent":
             return (model, positive, negative)  # latent coupleの場合は何もしない
 
         self.negative_positive_masks = []
         self.negative_positive_conds = []
         self.isolation_factor = isolation_factor
+        self.shared_weight = shared_weight
 
         new_positive = copy.deepcopy(positive)
         new_negative = copy.deepcopy(negative)
 
         dtype = model.model.diffusion_model.dtype
         device = comfy.model_management.get_torch_device()
+
+        # Handle shared conditioning (applied globally without masking)
+        if shared_positive is not None:
+            self.shared_cond = shared_positive[0][0].to(device, dtype=dtype)
+        else:
+            self.shared_cond = None
 
         # maskとcondをリストに格納する
         for conditions in [new_negative, new_positive]:
@@ -116,43 +127,76 @@ class AttentionCouple:
             masks_uncond = get_masks_from_q(self.negative_positive_masks[0], q_list[0], extra_options["original_shape"])
             masks_cond = get_masks_from_q(self.negative_positive_masks[1], q_list[0], extra_options["original_shape"])
 
-            cond_size = self.negative_positive_conds[1][0].shape[1]
-            context_uncond = torch.cat([cond[:, :cond_size] for cond in self.negative_positive_conds[0]], dim=0)
-            context_cond = torch.cat([cond[:, :cond_size] for cond in self.negative_positive_conds[1]], dim=0)
+            # Pad conditionings to max token length instead of truncating
+            def pad_conds_to_max(conds):
+                max_size = max(c.shape[1] for c in conds)
+                result = []
+                for c in conds:
+                    if c.shape[1] < max_size:
+                        pad = torch.zeros(c.shape[0], max_size - c.shape[1], c.shape[2],
+                                          device=c.device, dtype=c.dtype)
+                        c = torch.cat([c, pad], dim=1)
+                    result.append(c)
+                return result
+
+            padded_neg = pad_conds_to_max(self.negative_positive_conds[0])
+            padded_pos = pad_conds_to_max(self.negative_positive_conds[1])
+
+            context_uncond = torch.cat(padded_neg, dim=0)
+            context_cond = torch.cat(padded_pos, dim=0)
 
             k_uncond = module.to_k(context_uncond)
             k_cond = module.to_k(context_cond)
             v_uncond = module.to_v(context_uncond)
             v_cond = module.to_v(context_cond)
 
+            # Prepare shared conditioning (unmasked, global)
+            has_shared = self.shared_cond is not None
+            if has_shared:
+                shared_k = module.to_k(self.shared_cond)
+                shared_v = module.to_v(self.shared_cond)
+
             out = []
             for i, c in enumerate(cond_or_uncond):
                 if c == 0:
                     masks = masks_cond
-                    k = k_cond
-                    v = v_cond
+                    k_r = k_cond
+                    v_r = v_cond
                     length = len_pos
                 else:
                     masks = masks_uncond
-                    k = k_uncond
-                    v = v_uncond
+                    k_r = k_uncond
+                    v_r = v_uncond
                     length = len_neg
 
                 q_target = q_list[i].repeat(length, 1, 1)
-                k = torch.cat([k[i].unsqueeze(0).repeat(b,1,1) for i in range(length)], dim=0)
-                v = torch.cat([v[i].unsqueeze(0).repeat(b,1,1) for i in range(length)], dim=0)
+                k_rep = torch.cat([k_r[j].unsqueeze(0).repeat(b, 1, 1) for j in range(length)], dim=0)
+                v_rep = torch.cat([v_r[j].unsqueeze(0).repeat(b, 1, 1) for j in range(length)], dim=0)
 
                 # Convert all tensors to the same dtype as q_target
-                k = k.to(dtype=q_target.dtype)
-                v = v.to(dtype=q_target.dtype)
+                k_rep = k_rep.to(dtype=q_target.dtype)
+                v_rep = v_rep.to(dtype=q_target.dtype)
                 masks = masks.to(dtype=q_target.dtype)
 
                 # Apply sharpened masks based on isolation factor
                 sharpened_masks = self.sharpen_masks(masks, self.isolation_factor)
                 
-                qkv = optimized_attention(q_target, k, v, extra_options["n_heads"])
-                qkv = qkv * sharpened_masks
-                qkv = qkv.view(length, b, -1, module.heads * module.dim_head).sum(dim=0)
+                # Regional attention (masked per-region)
+                qkv_regional = optimized_attention(q_target, k_rep, v_rep, extra_options["n_heads"])
+                qkv_regional = qkv_regional * sharpened_masks
+                qkv_regional = qkv_regional.view(length, b, -1, module.heads * module.dim_head).sum(dim=0)
+
+                # Shared attention (unmasked, only for conditional path)
+                if has_shared and c == 0:
+                    q_s = q_list[i]
+                    sk = shared_k.repeat(b, 1, 1).to(dtype=q_s.dtype)
+                    sv = shared_v.repeat(b, 1, 1).to(dtype=q_s.dtype)
+                    qkv_shared = optimized_attention(q_s, sk, sv, extra_options["n_heads"])
+
+                    sw = self.shared_weight
+                    qkv = (1.0 - sw) * qkv_regional + sw * qkv_shared
+                else:
+                    qkv = qkv_regional
 
                 out.append(qkv)
 

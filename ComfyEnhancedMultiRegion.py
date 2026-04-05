@@ -18,6 +18,8 @@ class ComfyMultiRegion:
                 "isolation_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
+                "shared_positive": ("CONDITIONING",),
+                "shared_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
                 **{f"positive_{i+1}": ("CONDITIONING",) for i in range(10)},
                 **{f"ratio_{i+1}": ("FLOAT", {"default": 0.5, "min": 0, "max": 1.0, "step": 0.01}) for i in range(9)},
                 **{f"weight_{i+1}": ("FLOAT", {"default": 1.0, "min": 0, "max": 10.0, "step": 0.1}) for i in range(10)}
@@ -30,6 +32,8 @@ class ComfyMultiRegion:
 
     def process(self, model, negative, orientation, num_regions, width, height, isolation_factor, **kwargs):
         try:
+            shared_positive = kwargs.get("shared_positive", None)
+            shared_weight = kwargs.get("shared_weight", 0.5)
             positives = [kwargs.get(f"positive_{i+1}") for i in range(num_regions)]
             ratios = [kwargs.get(f"ratio_{i+1}", 1.0 / num_regions) for i in range(num_regions - 1)]
             weights = [kwargs.get(f"weight_{i+1}", 1.0) for i in range(num_regions)]
@@ -53,7 +57,7 @@ class ComfyMultiRegion:
             for mask in conditioned_masks[1:]:
                 positive_combined = ConditioningCombine().combine(positive_combined, mask)[0]
 
-            return AttentionCouple().attention_couple(model, positive_combined, negative, "Attention", isolation_factor)
+            return AttentionCouple().attention_couple(model, positive_combined, negative, "Attention", isolation_factor, shared_positive, shared_weight)
         except Exception as e:
             print(f"An error occurred: {str(e)}")
             return None, None, None
