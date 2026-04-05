@@ -48,34 +48,27 @@ class AttentionCouple:
                 "isolation_factor": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
-                "shared_positive": ("CONDITIONING",),
-                "shared_weight": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "cross_region_blend": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 1.0, "step": 0.01}),
             }
         }
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
     FUNCTION = "attention_couple"
     CATEGORY = "loaders"
 
-    def attention_couple(self, model, positive, negative, mode, isolation_factor, shared_positive=None, shared_weight=0.5):
+    def attention_couple(self, model, positive, negative, mode, isolation_factor, cross_region_blend=0.3):
         if mode == "Latent":
             return (model, positive, negative)  # latent coupleの場合は何もしない
 
         self.negative_positive_masks = []
         self.negative_positive_conds = []
         self.isolation_factor = isolation_factor
-        self.shared_weight = shared_weight
+        self.cross_region_blend = cross_region_blend
 
         new_positive = copy.deepcopy(positive)
         new_negative = copy.deepcopy(negative)
 
         dtype = model.model.diffusion_model.dtype
         device = comfy.model_management.get_torch_device()
-
-        # Handle shared conditioning (applied globally without masking)
-        if shared_positive is not None:
-            self.shared_cond = shared_positive[0][0].to(device, dtype=dtype)
-        else:
-            self.shared_cond = None
 
         # maskとcondをリストに格納する
         for conditions in [new_negative, new_positive]:
@@ -94,6 +87,18 @@ class AttentionCouple:
             self.negative_positive_masks.append(conditions_masks)
             self.negative_positive_conds.append(conditions_conds)
         self.conditioning_length = (len(new_negative), len(new_positive))
+
+        # Pre-compute cross-region conditioning similarity matrix
+        pos_conds = self.negative_positive_conds[1]
+        if len(pos_conds) > 1 and cross_region_blend > 0:
+            cond_means = torch.stack([c.mean(dim=(0, 1)) for c in pos_conds])  # [n_regions, dim]
+            cond_norms = F.normalize(cond_means, dim=-1)
+            sim_matrix = torch.mm(cond_norms, cond_norms.t())  # [n_regions, n_regions]
+            sim_matrix = sim_matrix.clamp(min=0) ** 2  # sharpen: similar stays high, dissimilar drops
+            sim_matrix = sim_matrix / sim_matrix.sum(dim=1, keepdim=True)  # normalize rows
+            self.cond_similarity = sim_matrix
+        else:
+            self.cond_similarity = None
 
         new_model = model.clone()
         self.sdxl = hasattr(new_model.model.diffusion_model, "label_emb")
@@ -150,12 +155,6 @@ class AttentionCouple:
             v_uncond = module.to_v(context_uncond)
             v_cond = module.to_v(context_cond)
 
-            # Prepare shared conditioning (unmasked, global)
-            has_shared = self.shared_cond is not None
-            if has_shared:
-                shared_k = module.to_k(self.shared_cond)
-                shared_v = module.to_v(self.shared_cond)
-
             out = []
             for i, c in enumerate(cond_or_uncond):
                 if c == 0:
@@ -181,22 +180,24 @@ class AttentionCouple:
                 # Apply sharpened masks based on isolation factor
                 sharpened_masks = self.sharpen_masks(masks, self.isolation_factor)
                 
-                # Regional attention (masked per-region)
+                # Regional attention
                 qkv_regional = optimized_attention(q_target, k_rep, v_rep, extra_options["n_heads"])
+
+                # Cross-region similarity blending (only for conditional path)
+                if self.cond_similarity is not None and c == 0:
+                    out_dim = qkv_regional.shape[-1]
+                    seq_len = qkv_regional.shape[1]
+                    qkv_per_region = qkv_regional.view(length, b, seq_len, out_dim)
+
+                    sim = self.cond_similarity.to(dtype=qkv_per_region.dtype, device=qkv_per_region.device)
+                    blended = torch.einsum('rj,jbsd->rbsd', sim, qkv_per_region)
+
+                    blend = self.cross_region_blend
+                    qkv_per_region = (1.0 - blend) * qkv_per_region + blend * blended
+                    qkv_regional = qkv_per_region.view(length * b, seq_len, out_dim)
+
                 qkv_regional = qkv_regional * sharpened_masks
-                qkv_regional = qkv_regional.view(length, b, -1, module.heads * module.dim_head).sum(dim=0)
-
-                # Shared attention (unmasked, only for conditional path)
-                if has_shared and c == 0:
-                    q_s = q_list[i]
-                    sk = shared_k.repeat(b, 1, 1).to(dtype=q_s.dtype)
-                    sv = shared_v.repeat(b, 1, 1).to(dtype=q_s.dtype)
-                    qkv_shared = optimized_attention(q_s, sk, sv, extra_options["n_heads"])
-
-                    sw = self.shared_weight
-                    qkv = (1.0 - sw) * qkv_regional + sw * qkv_shared
-                else:
-                    qkv = qkv_regional
+                qkv = qkv_regional.view(length, b, -1, module.heads * module.dim_head).sum(dim=0)
 
                 out.append(qkv)
 
